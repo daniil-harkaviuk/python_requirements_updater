@@ -1,29 +1,133 @@
 #!/usr/bin/env python3
+"""
+requirements_updater.py
+
+Updates pinned requirements (pkg==X.Y.Z) to the *first* newer version that has
+a CPython 3.12-compatible wheel (cp312 / abi3 / py3 wheel).
+
+NEW: Cross-dependency checker for packages that are ALSO pinned in requirements.txt.
+Example:
+  eth-abi==3.0.0 requires eth-utils>=2.0.0,<3.0.0
+  If requirements.txt pins eth-utils==3.0.0 -> conflict is detected.
+The script will try to bump eth-abi to a newer candidate that becomes compatible.
+If impossible -> raises with a clear error.
+
+Usage:
+  python requirements_updater.py requirements.txt --py 3.12.3 --out requirements.py312.txt --report
+
+Notes:
+- Only exact pins "==" are updated. Other lines are preserved as-is.
+- Dependency checking uses PyPI "requires_dist" (PEP 508). Markers are evaluated
+  only for python_version/python_full_version; extend env if needed.
+"""
+
 from __future__ import annotations
 
 import argparse
 import re
+import sys
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
+from packaging.markers import Marker
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
-from packaging.version import Version, InvalidVersion
-from packaging.markers import Marker
+from packaging.version import InvalidVersion, Version
 
 
 PYPI_PROJECT_JSON = "https://pypi.org/pypi/{name}/json"
 PYPI_VERSION_JSON = "https://pypi.org/pypi/{name}/{version}/json"
 
-WHEEL_RE = re.compile(r"^(?P<namever>.+)-(?P<py>[^-]+)-(?P<abi>[^-]+)-(?P<plat>[^-]+)\.whl$")
+_WHEEL_RE = re.compile(r"^(?P<namever>.+)-(?P<py>[^-]+)-(?P<abi>[^-]+)-(?P<plat>[^-]+)\.whl$")
 
 
-def target_cp_tag(py: Version) -> str:
-    return f"cp{py.major}{py.minor:02d}"  # 3.12 -> cp312
+# -----------------------------
+# requirements.txt parsing utils
+# -----------------------------
+
+def strip_inline_comment(line: str) -> str:
+    if line.lstrip().startswith("#"):
+        return line
+    m = re.search(r"\s+#", line)
+    if m:
+        return line[: m.start()].rstrip()
+    return line.rstrip("\n")
 
 
-def parse_cp_num(tag: str) -> Optional[int]:
+def is_control_line(s: str) -> bool:
+    s2 = s.strip()
+    return (
+        not s2
+        or s2.startswith("#")
+        or s2.startswith("-r ")
+        or s2.startswith("--requirement ")
+        or s2.startswith("-c ")
+        or s2.startswith("--constraint ")
+        or s2.startswith("--find-links ")
+        or s2.startswith("-f ")
+        or s2.startswith("--index-url ")
+        or s2.startswith("--extra-index-url ")
+        or s2.startswith("--trusted-host ")
+    )
+
+
+def pinned_eq_version(req: Requirement) -> Optional[Version]:
+    specs = list(req.specifier)
+    if len(specs) != 1 or specs[0].operator != "==":
+        return None
+    try:
+        return Version(specs[0].version)
+    except InvalidVersion:
+        return None
+
+
+@dataclass
+class ParsedLine:
+    raw: str
+    req: Optional[Requirement] = None
+    pinned: Optional[Version] = None
+    comment_suffix: str = ""
+
+
+def parse_requirement_lines(lines: Iterable[str]) -> List[ParsedLine]:
+    parsed: List[ParsedLine] = []
+    for raw in lines:
+        raw = raw.rstrip("\n")
+        if is_control_line(raw):
+            parsed.append(ParsedLine(raw=raw))
+            continue
+
+        stripped = strip_inline_comment(raw)
+        comment = raw[len(stripped):] if stripped != raw else ""
+
+        try:
+            req = Requirement(stripped)
+        except Exception:
+            parsed.append(ParsedLine(raw=raw))
+            continue
+
+        pinned = pinned_eq_version(req)
+        parsed.append(ParsedLine(raw=raw, req=req, pinned=pinned, comment_suffix=comment))
+    return parsed
+
+
+def render_requirement(req: Requirement, ver: Version, comment_suffix: str) -> str:
+    extras = f"[{','.join(sorted(req.extras))}]" if req.extras else ""
+    marker = f"; {req.marker}" if req.marker else ""
+    return f"{req.name}{extras}=={ver}{marker}{comment_suffix}"
+
+
+# -----------------------------
+# wheel compatibility (CPython)
+# -----------------------------
+
+def _target_cp_tag(py: Version) -> str:
+    # 3.12 -> cp312
+    return f"cp{py.major}{py.minor:02d}"
+
+
+def _parse_cp_num(tag: str) -> Optional[int]:
     if not tag.startswith("cp"):
         return None
     rest = tag[2:]
@@ -31,23 +135,30 @@ def parse_cp_num(tag: str) -> Optional[int]:
 
 
 def wheel_supports_target(filename: str, target_py: Version) -> bool:
-    m = WHEEL_RE.match(filename or "")
+    """
+    Accept if:
+      - pure python wheel includes py3 (usually py3-none-any)
+      - exact cp312 wheel exists
+      - abi3 wheel with cpXY where XY <= target (cp38-abi3 works on 3.12)
+    """
+    m = _WHEEL_RE.match(filename or "")
     if not m:
         return False
+
     py_tags = m.group("py").split(".")
     abi = m.group("abi")
 
     if "py3" in py_tags or "py2.py3" in py_tags:
         return True
 
-    tgt = target_cp_tag(target_py)
+    tgt = _target_cp_tag(target_py)
     if tgt in py_tags:
         return True
 
     if abi == "abi3":
         tgt_num = int(tgt[2:])
         for t in py_tags:
-            n = parse_cp_num(t)
+            n = _parse_cp_num(t)
             if n is not None and n <= tgt_num:
                 return True
 
@@ -62,16 +173,65 @@ def release_has_compatible_wheel(files: list, target_py: Version) -> bool:
     return False
 
 
-def fetch_json(url: str, session: requests.Session) -> dict:
-    r = session.get(url, timeout=30)
-    r.raise_for_status()
-    return r.json()
+# -----------------------------
+# PyPI querying + caching
+# -----------------------------
+
+class PypiClient:
+    def __init__(self) -> None:
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "requirements-updater/py312 (+https://pypi.org)"})
+        self._project_cache: Dict[str, dict] = {}
+        self._version_cache: Dict[Tuple[str, str], dict] = {}
+
+    def project_json(self, name: str) -> dict:
+        key = name.lower()
+        if key in self._project_cache:
+            return self._project_cache[key]
+        url = PYPI_PROJECT_JSON.format(name=name)
+        r = self.session.get(url, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        self._project_cache[key] = data
+        return data
+
+    def version_json(self, name: str, version: Version) -> dict:
+        key = (name.lower(), str(version))
+        if key in self._version_cache:
+            return self._version_cache[key]
+        url = PYPI_VERSION_JSON.format(name=name, version=str(version))
+        r = self.session.get(url, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        self._version_cache[key] = data
+        return data
+
+    def requires_dist(self, name: str, version: Version) -> List[Requirement]:
+        data = self.version_json(name, version)
+        reqs = data.get("info", {}).get("requires_dist") or []
+        out: List[Requirement] = []
+        for s in reqs:
+            try:
+                out.append(Requirement(s))
+            except Exception:
+                continue
+        return out
 
 
-def build_candidates(name: str, current: Version, target_py: Version, session: requests.Session) -> List[Version]:
-    data = fetch_json(PYPI_PROJECT_JSON.format(name=name), session)
+def build_candidates(
+    client: PypiClient,
+    pkg_name: str,
+    current: Version,
+    target_py: Version,
+    include_prereleases: bool,
+) -> List[Version]:
+    """
+    Returns compatible versions >= current (ascending) that have compatible wheels for target_py.
+    """
+    data = client.project_json(pkg_name)
     releases = data.get("releases", {})
-    vs: List[Version] = []
+
+    versions: List[Version] = []
     for v_str in releases.keys():
         try:
             v = Version(v_str)
@@ -79,176 +239,280 @@ def build_candidates(name: str, current: Version, target_py: Version, session: r
             continue
         if v < current:
             continue
+        if v.is_prerelease and not include_prereleases:
+            continue
         files = releases.get(v_str, [])
         if files and all(bool(f.get("yanked")) for f in files):
             continue
         if release_has_compatible_wheel(files, target_py):
-            vs.append(v)
-    vs.sort()
-    return vs
+            versions.append(v)
 
+    versions.sort()
+    return versions
+
+
+# -----------------------------
+# Markers evaluation for deps
+# -----------------------------
 
 def marker_allows(req: Requirement, target_py: Version) -> bool:
-    """
-    Evaluate PEP 508 markers for a target env. We only set python_version/python_full_version here.
-    You can extend with platform_system, sys_platform, etc.
-    """
     if req.marker is None:
         return True
     env = {
         "python_version": f"{target_py.major}.{target_py.minor}",
         "python_full_version": str(target_py),
-        # Extend if you want:
+        # Extend if you want stronger correctness:
         # "sys_platform": "linux",
         # "platform_system": "Linux",
     }
     try:
         return req.marker.evaluate(env)
     except Exception:
-        # If marker parsing fails, be conservative and keep it
+        # If marker is weird/unparseable, don't block.
         return True
 
 
-def get_requires_dist(name: str, version: Version, session: requests.Session) -> List[Requirement]:
-    data = fetch_json(PYPI_VERSION_JSON.format(name=name, version=version), session)
-    reqs = data.get("info", {}).get("requires_dist") or []
-    out: List[Requirement] = []
-    for s in reqs:
-        try:
-            out.append(Requirement(s))
-        except Exception:
-            continue
-    return out
-
+# -----------------------------
+# Cross-dependency checking
+# -----------------------------
 
 @dataclass
-class Decision:
-    name: str
-    version: Version
+class DepConflict:
+    depender: str
+    depender_version: Version
+    dependency: str
+    dependency_version: Version
+    required_spec: str
 
 
-def merge_constraint(constraints: Dict[str, SpecifierSet], pkg: str, spec: SpecifierSet) -> None:
-    if pkg not in constraints:
-        constraints[pkg] = spec
-    else:
-        # intersection: SpecifierSet string concat behaves like AND
-        constraints[pkg] = SpecifierSet(str(constraints[pkg]) + "," + str(spec))
-
-
-def satisfies(constraints: Dict[str, SpecifierSet], pkg: str, ver: Version) -> bool:
-    spec = constraints.get(pkg)
-    if spec is None:
-        return True
-    return spec.contains(str(ver), prereleases=True)
-
-
-def resolve_minimal(
-    top_level: Dict[str, Version],
+def find_cross_conflicts(
+    client: PypiClient,
+    selected: Dict[str, Version],
     target_py: Version,
-    session: requests.Session,
-) -> Dict[str, Version]:
+) -> List[DepConflict]:
     """
-    Backtracking resolver selecting the minimal candidate versions satisfying:
-    - top-level >= pinned (since candidates built from current upward)
-    - all requires_dist constraints (for markers that apply to target_py)
+    Checks dependencies between packages present in `selected` only.
+
+    For each selected package A==v, read requires_dist and if it mentions B
+    and B is also selected, ensure selected[B] satisfies the specifier.
     """
-    # Candidate lists for each top-level package
-    cand: Dict[str, List[Version]] = {
-        name: build_candidates(name, pinned, target_py, session) for name, pinned in top_level.items()
-    }
+    conflicts: List[DepConflict] = []
 
-    # If any top-level has no candidates, keep pinned (might still fail later)
-    for name, pinned in top_level.items():
-        if not cand[name]:
-            cand[name] = [pinned]
+    for a_name, a_ver in selected.items():
+        try:
+            deps = client.requires_dist(a_name, a_ver)
+        except requests.RequestException:
+            continue
 
-    chosen: Dict[str, Version] = {}
-    constraints: Dict[str, SpecifierSet] = {}
-
-    # seed constraints from top-level pins themselves (exact ==)
-    for name, pinned in top_level.items():
-        merge_constraint(constraints, name, SpecifierSet(f"=={pinned}"))
-
-    names = sorted(top_level.keys())  # deterministic
-
-    def dfs(i: int) -> bool:
-        if i == len(names):
-            return True
-
-        name = names[i]
-
-        # Try candidates in ascending order
-        for v in cand[name]:
-            # Must be >= pinned, and satisfy accumulated constraints
-            if not satisfies(constraints, name, v):
+        for dep in deps:
+            if not marker_allows(dep, target_py):
                 continue
 
-            # Tentatively choose
-            chosen[name] = v
+            b_name = dep.name.lower()
+            if b_name not in selected:
+                continue
 
-            # Save constraints snapshot
-            saved = dict(constraints)
+            spec = dep.specifier
+            if not str(spec):
+                # no version constraint -> always ok
+                continue
 
-            # Apply dependencies constraints
+            b_ver = selected[b_name]
+            if not spec.contains(str(b_ver), prereleases=True):
+                conflicts.append(
+                    DepConflict(
+                        depender=a_name,
+                        depender_version=a_ver,
+                        dependency=b_name,
+                        dependency_version=b_ver,
+                        required_spec=str(spec),
+                    )
+                )
+
+    return conflicts
+
+
+def try_fix_conflicts_by_bumping_dependers(
+    client: PypiClient,
+    selected: Dict[str, Version],
+    candidates: Dict[str, List[Version]],
+    target_py: Version,
+    max_rounds: int = 50,
+) -> Tuple[Dict[str, Version], List[DepConflict]]:
+    """
+    Attempts to fix conflicts by bumping ONLY the depender package (A),
+    to the next candidate version, until:
+      - no conflicts remain, or
+      - no more progress is possible.
+
+    This keeps the "upgrade-only" nature intact.
+    """
+    selected = dict(selected)
+
+    for _ in range(max_rounds):
+        conflicts = find_cross_conflicts(client, selected, target_py)
+        if not conflicts:
+            return selected, []
+
+        progressed = False
+
+        # deterministic order: bump dependers in sorted order
+        by_depender = {}
+        for c in conflicts:
+            by_depender.setdefault(c.depender, []).append(c)
+
+        for depender in sorted(by_depender.keys()):
+            curr = selected[depender]
+            cand_list = candidates.get(depender, [])
+            if not cand_list:
+                continue
+
             try:
-                deps = get_requires_dist(name, v, session)
-            except requests.RequestException:
-                deps = []
-
-            for dep in deps:
-                if not marker_allows(dep, target_py):
+                idx = cand_list.index(curr)
+            except ValueError:
+                # If curr not in list, try to find first >= curr
+                idx = -1
+                for i, v in enumerate(cand_list):
+                    if v >= curr:
+                        idx = i
+                        break
+                if idx == -1:
                     continue
-                dep_name = dep.name.lower()
-                # Add constraint from specifier
-                if str(dep.specifier):
-                    merge_constraint(constraints, dep_name, dep.specifier)
 
-                # If we already chose dep as top-level, validate immediately
-                if dep_name in chosen and not satisfies(constraints, dep_name, chosen[dep_name]):
+            # Try next candidates until conflicts caused by this depender disappear
+            for next_i in range(idx + 1, len(cand_list)):
+                trial_ver = cand_list[next_i]
+                selected[depender] = trial_ver
+
+                # re-check only; cheap enough
+                new_conflicts = find_cross_conflicts(client, selected, target_py)
+
+                # accept the bump if it reduces conflicts for this depender
+                still_bad_for_depender = [
+                    cc for cc in new_conflicts if cc.depender == depender
+                ]
+                if not still_bad_for_depender:
+                    progressed = True
                     break
-            else:
-                # no break -> proceed
-                if dfs(i + 1):
-                    return True
 
-            # backtrack
-            constraints.clear()
-            constraints.update(saved)
-            chosen.pop(name, None)
+            if not progressed:
+                # restore if no bump helped
+                selected[depender] = curr
 
-        return False
+        if not progressed:
+            # stuck
+            return selected, find_cross_conflicts(client, selected, target_py)
 
-    ok = dfs(0)
-    if not ok:
-        raise RuntimeError("Could not resolve constraints using only PyPI metadata.")
+    return selected, find_cross_conflicts(client, selected, target_py)
 
-    return chosen
 
+# -----------------------------
+# main update flow
+# -----------------------------
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--py", default="3.12.3")
-    ap.add_argument("reqs", nargs="+", help="Pinned requirements like eth-abi==3.0.0 numpy==1.24.4")
+    ap.add_argument("requirements", help="Path to requirements.txt")
+    ap.add_argument("--out", default="requirements.py312.txt", help="Output requirements file")
+    ap.add_argument("--py", default="3.12.3", help="Target Python version (default 3.12.3)")
+    ap.add_argument("--include-prereleases", action="store_true", help="Allow pre-releases")
+    ap.add_argument("--report", action="store_true", help="Print changes and dependency conflicts to stderr")
     args = ap.parse_args()
 
-    target_py = Version(args.py)
-    top_level: Dict[str, Version] = {}
-    for s in args.reqs:
-        r = Requirement(s)
-        pinned = None
-        for sp in r.specifier:
-            if sp.operator == "==":
-                pinned = Version(sp.version)
-        if pinned is None:
-            raise SystemExit(f"Only pinned == supported in this demo: {s}")
-        top_level[r.name.lower()] = pinned
+    try:
+        target_py = Version(args.py)
+    except InvalidVersion:
+        print(f"Invalid --py version: {args.py}", file=sys.stderr)
+        return 2
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": "no-pip-resolver/0.1 (+https://pypi.org)"})
+    with open(args.requirements, "r", encoding="utf-8") as f:
+        lines = f.readlines()
 
-    solved = resolve_minimal(top_level, target_py, session)
-    for k, v in solved.items():
-        print(f"{k}=={v}")
+    parsed = parse_requirement_lines(lines)
+
+    # collect pinned top-level packages
+    pinned_top: Dict[str, ParsedLine] = {}
+    for pl in parsed:
+        if pl.req and pl.pinned:
+            pinned_top[pl.req.name.lower()] = pl
+
+    if not pinned_top:
+        # nothing to do
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write("".join(lines))
+        return 0
+
+    client = PypiClient()
+
+    # Build candidates and initial selections (first candidate)
+    candidates: Dict[str, List[Version]] = {}
+    selected: Dict[str, Version] = {}
+    for name_l, pl in pinned_top.items():
+        try:
+            cand = build_candidates(
+                client=client,
+                pkg_name=pl.req.name,  # type: ignore
+                current=pl.pinned,     # type: ignore
+                target_py=target_py,
+                include_prereleases=args.include_prereleases,
+            )
+        except requests.RequestException as e:
+            cand = [pl.pinned]  # type: ignore
+            if args.report:
+                print(f"[WARN] PyPI query failed for {pl.req.name}: {e}", file=sys.stderr)  # type: ignore
+
+        if not cand:
+            cand = [pl.pinned]  # type: ignore
+
+        candidates[name_l] = cand
+        selected[name_l] = cand[0]
+
+    # NEW: cross-dependency check + attempt to fix by bumping dependers
+    selected, conflicts = try_fix_conflicts_by_bumping_dependers(
+        client=client,
+        selected=selected,
+        candidates=candidates,
+        target_py=target_py,
+    )
+
+    # Render updated file
+    out_lines: List[str] = []
+    changes: List[str] = []
+    for pl in parsed:
+        if pl.req and pl.pinned:
+            name_l = pl.req.name.lower()
+            new_ver = selected[name_l]
+            out_lines.append(render_requirement(pl.req, new_ver, pl.comment_suffix))
+            if new_ver != pl.pinned:
+                changes.append(f"{pl.req.name}: {pl.pinned} -> {new_ver}")
+        else:
+            out_lines.append(pl.raw)
+
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write("\n".join(out_lines) + "\n")
+
+    if args.report:
+        if changes:
+            print("Updated pins:", file=sys.stderr)
+            for c in changes:
+                print(f"  - {c}", file=sys.stderr)
+        else:
+            print("No pinned packages were changed.", file=sys.stderr)
+
+    if conflicts:
+        # Produce a helpful error and non-zero exit
+        msg_lines = ["Dependency conflicts between pinned requirements:"]
+        for c in conflicts:
+            msg_lines.append(
+                f"  - {c.depender}=={c.depender_version} requires {c.dependency}{c.required_spec}, "
+                f"but pinned/selected {c.dependency}=={c.dependency_version}"
+            )
+        msg_lines.append("")
+        msg_lines.append("Fix options:")
+        msg_lines.append("  1) Bump the depender package to a version that supports the pinned dependency, or")
+        msg_lines.append("  2) Change the pinned dependency version to satisfy the depender's constraint.")
+        print("\n".join(msg_lines), file=sys.stderr)
+        return 1
 
     return 0
 
